@@ -1,8 +1,8 @@
 """
-Datei- und Ordnerumbenennung - Flet Desktop App
-Python 3.10+, Flet 1.0.4
+Datei- und Ordnerumbenennung - Flet 1.0.4
+Python 3.10+
 
-Start:      python main.py
+Start:           python main.py
 Build (Windows): pip install flet pyinstaller && flet pack main.py --name DateiUmbenenner
 """
 
@@ -13,11 +13,9 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import flet as ft
 from platformdirs import user_config_dir
-
 
 # ---------------------------------------------------------------------------
 # Persistenz
@@ -32,9 +30,12 @@ def _ensure_config_dir() -> None:
 
 
 def load_config() -> dict:
-    """Lädt config.json oder legt Defaults an."""
     _ensure_config_dir()
-    default = {"last_directory": "", "case_sensitive": True}
+    default = {
+        "last_directory": "",
+        "case_sensitive": True,
+        "handle_collisions": False,
+    }
     if CONFIG_FILE.exists():
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -52,7 +53,6 @@ def save_config(cfg: dict) -> None:
 
 
 def load_history() -> list[dict]:
-    """Lädt die Historie (max. 10)."""
     _ensure_config_dir()
     if not HISTORY_FILE.exists():
         return []
@@ -76,38 +76,85 @@ def save_history(history: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 # Kern-Logik
 # ---------------------------------------------------------------------------
-def apply_rules(
-    name: str, rules: list[dict], case_sensitive: bool
-) -> str:
-    """Wendet die Regel-Liste sequenziell auf `name` an."""
+def compile_search_pattern(search: str, case_sensitive: bool) -> re.Pattern | None:
+    """
+    Wandelt einen Suchbegriff mit Wildcards in ein Regex-Muster um.
+
+    Wildcards:
+      *  → beliebig viele Zeichen (auch keine)   → .*
+      ?  → genau ein Zeichen                     → .
+      Alles andere wird literal behandelt.
+
+    Sonderfall: Besteht das Muster ausschließlich aus Wildcards (keine
+    literalen Zeichen), wird es mit \\A...\\Z verankert. Das verhindert das
+    bekannte re.sub-Verhalten, dass ein Muster wie .* am Ende der Zeichenkette
+    ein zweites (leeres) Match erzeugt und dadurch der Ersatz doppelt
+    eingefügt wird (z. B. search="*", replace="blub" ergäbe sonst "blubblub").
+    """
+    if not search:
+        return None
+
+    parts: list[str] = []
+    has_literal = False
+    for ch in search:
+        if ch == "*":
+            parts.append(".*")
+        elif ch == "?":
+            parts.append(".")
+        else:
+            parts.append(re.escape(ch))
+            has_literal = True
+
+    body = "".join(parts)
+    if not has_literal:
+        body = rf"\A{body}\Z"
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.compile(body, flags)
+
+
+def apply_rules(name: str, rules: list[dict], case_sensitive: bool) -> tuple[str, bool]:
+    """
+    Wendet die Regel-Liste sequenziell auf `name` an.
+
+    Wildcards im Suchbegriff:
+      *  → beliebig viele Zeichen
+      ?  → genau ein Zeichen
+
+    required=True bedeutet:
+      Die Regel wird NUR angewendet, wenn der AKTUELLE Name (nach vorherigen
+      Regeln) den Suchbegriff enthält. Andernfalls wird sie übersprungen.
+    required=False bedeutet:
+      Die Regel wird immer angewendet (Substitution, auch wenn nichts matcht –
+      dann bleibt der Name unverändert).
+
+    Rückgabe: (result, applied)
+    """
     result = name
+    applied = False
     for rule in rules:
         search = rule.get("search", "")
         replace = rule.get("replace", "")
         required = bool(rule.get("required", False))
-        if not search:
+        pattern = compile_search_pattern(search, case_sensitive)
+        if pattern is None:
             continue
-        flags = 0 if case_sensitive else re.IGNORECASE
-        pattern = re.compile(re.escape(search), flags)
         if required:
-            # Nur anwenden, wenn der aktuelle Name den Suchbegriff enthält
             if pattern.search(result):
                 result = pattern.sub(replace, result)
+                applied = True
         else:
             result = pattern.sub(replace, result)
-    return result
+            applied = True
+    return result, applied
 
 
 def sanitize_filename(name: str) -> str:
-    """Entfernt für Windows ungültige Zeichen aus einem Dateinamen."""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     return name.strip().rstrip(".") or "_"
 
 
-def scan_targets(
-    directory: str, mode: str, include_subfolders: bool
-) -> list[Path]:
-    """Sammelt Dateien (mode='file') oder Ordner (mode='dir')."""
+def scan_targets(directory: str, mode: str, include_subfolders: bool) -> list[Path]:
     if not directory or not Path(directory).is_dir():
         return []
     root = Path(directory)
@@ -119,7 +166,6 @@ def scan_targets(
                 for f in files:
                     results.append(cur / f)
             else:
-                # Ordner rekursiv: alle Unterordner außer dem Root selbst
                 for d in dirs:
                     results.append(cur / d)
     else:
@@ -131,54 +177,147 @@ def scan_targets(
     return results
 
 
+def _build_numbered_name(
+    desired: str, suffix: str, number: int, leading_zeros: int, is_file: bool
+) -> str:
+    """Baut aus 'desired' einen Namen mit Suffix + Nummer vor der Endung."""
+    if is_file:
+        stem = Path(desired).stem
+        ext = Path(desired).suffix
+    else:
+        stem = desired
+        ext = ""
+    num = str(number).zfill(max(0, leading_zeros))
+    return f"{stem}{suffix}{num}{ext}"
+
+
 def build_preview(
     directory: str,
     mode: str,
     include_subfolders: bool,
     rules: list[dict],
     case_sensitive: bool,
+    handle_collisions: bool,
+    suffix: str,
+    leading_zeros: int,
 ) -> list[dict]:
     """
-    Erzeugt die Vorschau: Liste von {path, old, new, status}.
-    Status: "OK" | "Kollision" | "Übersprungen".
+    Erzeugt die Vorschau inkl. Kollisionsauflösung.
+
+    Wichtige Prinzipien:
+    - Ein Eintrag wird nur dann als "betroffen" betrachtet, wenn sich sein
+      Name durch die Regeln tatsächlich ändert.
+    - Kollisionen werden NUR zwischen betroffenen Einträgen bzw. zwischen
+      betroffenen Einträgen und NICHT betroffenen (also unveränderten)
+      Einträgen im selben Verzeichnis geprüft.
+    - Der eigene Originalname eines Eintrags zählt NICHT als Kollision.
+    - Bei deaktivierter Kollisionsbehandlung werden kollidierende Einträge
+      als "Kollision" markiert (und erscheinen trotzdem in der Vorschau!).
+    - Bei aktivierter Kollisionsbehandlung werden sie mit Suffix+Nummer
+      eindeutig gemacht und als "OK (angepasst)" markiert.
     """
     targets = scan_targets(directory, mode, include_subfolders)
     preview: list[dict] = []
+    is_file_mode = mode == "file"
+
     for p in targets:
         old_name = p.name
-        new_name = apply_rules(old_name, rules, case_sensitive)
-        if mode == "file":
-            # Extension beim Filenamen beibehalten, wenn keine Regel sie ändert
-            new_name = sanitize_filename(new_name)
-        else:
-            new_name = sanitize_filename(new_name)
+        new_raw, _applied = apply_rules(old_name, rules, case_sensitive)
+        new_name = sanitize_filename(new_raw)
+        name_changed = new_name != old_name
 
-        if new_name == old_name:
-            status = "Übersprungen"
-        elif not new_name:
+        if not new_name or not name_changed:
             status = "Übersprungen"
         else:
             status = "OK"
+
         preview.append(
             {
                 "path": str(p),
                 "old": old_name,
                 "new": new_name,
                 "status": status,
+                "parent": str(p.parent),
+                "affected": name_changed,
             }
         )
 
-    # Kollisionen im selben Elternverzeichnis erkennen
-    groups: dict[tuple[str, str], list[dict]] = {}
+    # Gruppierung nach Elternverzeichnis
+    per_parent: dict[str, list[dict]] = {}
     for item in preview:
-        if item["status"] == "Übersprungen":
-            continue
-        parent = str(Path(item["path"]).parent)
-        groups.setdefault((parent, item["new"].lower()), []).append(item)
-    for items in groups.values():
-        if len(items) > 1:
-            for it in items:
+        per_parent.setdefault(item["parent"], []).append(item)
+
+    for parent, items in per_parent.items():
+        # Namen der Einträge, die selbst umbenannt werden (deren Originalnamen
+        # also "frei" werden und nicht als blockierend zählen).
+        affected_old_names = {it["old"].lower() for it in items if it["affected"]}
+
+        # Alle aktuell im Verzeichnis existierenden Namen (lowercase)
+        try:
+            all_names = {p.name.lower() for p in Path(parent).iterdir()}
+        except Exception:
+            all_names = set()
+
+        # "Blockierende" Namen = existierende Namen, die NICHT selbst umbenannt
+        # werden. Nur diese können echte Kollisionen verursachen.
+        blocking = all_names - affected_old_names
+
+        # Zielnamen zählen (nur betroffene Einträge)
+        target_counts: dict[str, int] = {}
+        for it in items:
+            if not it["affected"]:
+                continue
+            key = it["new"].lower()
+            target_counts[key] = target_counts.get(key, 0) + 1
+
+        reserved: set[str] = set()
+        counter: dict[str, int] = {}
+
+        for it in items:
+            if not it["affected"]:
+                continue
+
+            desired = it["new"]
+            key = desired.lower()
+
+            # Kollision, wenn:
+            # - mehrere betroffene Einträge denselben Zielnamen haben
+            # - der Zielname mit einer nicht-umbenannten Datei kollidiert
+            # - der Zielname bereits von einem anderen Eintrag reserviert wurde
+            collides_with_other_target = target_counts.get(key, 0) > 1
+            collides_with_existing = key in blocking
+            collides_with_reserved = key in reserved
+
+            needs_resolution = (
+                collides_with_other_target
+                or collides_with_existing
+                or collides_with_reserved
+            )
+
+            if not needs_resolution:
+                reserved.add(key)
+                continue
+
+            if not handle_collisions:
                 it["status"] = "Kollision"
+                reserved.add(key)
+                continue
+
+            # Auflösung: Suffix + laufende Nummer
+            n = counter.get(key, 0)
+            while True:
+                n += 1
+                candidate = _build_numbered_name(
+                    desired, suffix or "_", n, leading_zeros, is_file_mode
+                )
+                cand_key = candidate.lower()
+                if cand_key not in blocking and cand_key not in reserved:
+                    break
+            counter[key] = n
+            reserved.add(cand_key)
+            it["new"] = candidate
+            it["status"] = "OK (angepasst)"
+
     return preview
 
 
@@ -192,62 +331,48 @@ def main(page: ft.Page) -> None:
     page.window.width = 1200
     page.window.height = 800
 
-    # ------------------------------------------------------------------
-    # Zustand
-    # ------------------------------------------------------------------
     config = load_config()
     history: list[dict] = load_history()
 
     state: dict = {
-        "mode": "file",  # "file" | "dir"
+        "mode": "file",
         "directory": config.get("last_directory", ""),
         "include_subfolders": False,
         "case_sensitive": bool(config.get("case_sensitive", True)),
+        "handle_collisions": bool(config.get("handle_collisions", False)),
         "suffix": "_",
         "leading_zeros": 0,
     }
 
-    # ------------------------------------------------------------------
-    # Regel-Liste (UI-Repräsentation)
-    # ------------------------------------------------------------------
-    rules_ui: list[dict] = []  # [{"search": tf, "replace": tf, "required": bool}]
+    rules_ui: list[dict] = []
 
-    # ------------------------------------------------------------------
-    # UI-Elemente
-    # ------------------------------------------------------------------
+    # --- Verzeichnis ------------------------------------------------------
     directory_field = ft.TextField(
-        label="Verzeichnis",
-        value=state["directory"],
-        read_only=True,
-        expand=True,
+        label="Verzeichnis", value=state["directory"], read_only=True, expand=True
     )
 
     file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
 
-    def on_pick_directory(e: ft.FilePickerResultEvent):
-        if e.path:
-            state["directory"] = e.path
-            directory_field.value = e.path
-            config["last_directory"] = e.path
-            save_config(config)
-            refresh_preview()
-
-    def open_directory_dialog(e):
-        file_picker.get_directory_path(
+    async def open_directory_dialog(e):
+        path = await file_picker.get_directory_path(
             dialog_title="Verzeichnis wählen",
             initial_directory=state["directory"] or None,
         )
+        if path:
+            state["directory"] = path
+            directory_field.value = path
+            config["last_directory"] = path
+            save_config(config)
+            refresh_preview()
+            page.update()
 
-    file_picker.on_result = on_pick_directory
-
-    directory_button = ft.ElevatedButton(
+    directory_button = ft.Button(
         "Verzeichnis wählen", icon=ft.Icons.FOLDER_OPEN, on_click=open_directory_dialog
     )
 
-    # Modus-Auswahl
+    # --- Modus ------------------------------------------------------------
     mode_segmented = ft.SegmentedButton(
-        selected={"file"},
+        selected=["file"],
         allow_multiple_selection=False,
         segments=[
             ft.Segment(value="file", label=ft.Text("Dateien umbenennen")),
@@ -258,25 +383,28 @@ def main(page: ft.Page) -> None:
     def on_mode_change(e):
         state["mode"] = next(iter(mode_segmented.selected))
         refresh_preview()
+        page.update()
 
     mode_segmented.on_change = on_mode_change
 
-    # Unterordner-Checkbox
+    # --- Checkboxen -------------------------------------------------------
+    def on_subfolders_change(e):
+        state["include_subfolders"] = e.control.value
+        refresh_preview()
+        page.update()
+
     subfolders_checkbox = ft.Checkbox(
         label="Unterordner einbeziehen",
         value=state["include_subfolders"],
-        on_change=lambda e: (
-            state.__setitem__("include_subfolders", e.control.value),
-            refresh_preview(),
-        ),
+        on_change=on_subfolders_change,
     )
 
-    # Case-Sensitivity
     def on_case_change(e):
         state["case_sensitive"] = e.control.value
         config["case_sensitive"] = e.control.value
         save_config(config)
         refresh_preview()
+        page.update()
 
     case_checkbox = ft.Checkbox(
         label="Groß-/Kleinschreibung beachten",
@@ -284,40 +412,73 @@ def main(page: ft.Page) -> None:
         on_change=on_case_change,
     )
 
-    # Kollisionsoptionen
+    # --- Kollisionsoptionen ----------------------------------------------
+    def on_suffix_change(e):
+        state["suffix"] = e.control.value or "_"
+        refresh_preview()
+        page.update()
+
     suffix_field = ft.TextField(
         label="Suffix",
         value=state["suffix"],
         width=100,
-        on_change=lambda e: state.__setitem__("suffix", e.control.value or "_"),
+        on_change=on_suffix_change,
     )
+
+    def on_leading_zeros_change(e):
+        state["leading_zeros"] = _parse_int(e.control.value)
+        refresh_preview()
+        page.update()
+
     leading_zeros_field = ft.TextField(
         label="Führende Nullen",
         value=str(state["leading_zeros"]),
         width=140,
         keyboard_type=ft.KeyboardType.NUMBER,
-        on_change=lambda e: state.__setitem__(
-            "leading_zeros", _parse_int(e.control.value)
-        ),
+        on_change=on_leading_zeros_change,
     )
 
-    # Regel-Container
+    collision_options_container = ft.Row(
+        spacing=16,
+        visible=state["handle_collisions"],
+        controls=[
+            ft.Text("Suffix:", size=12),
+            suffix_field,
+            leading_zeros_field,
+        ],
+    )
+
+    def on_collision_checkbox_change(e):
+        state["handle_collisions"] = e.control.value
+        config["handle_collisions"] = e.control.value
+        save_config(config)
+        collision_options_container.visible = e.control.value
+        refresh_preview()
+        page.update()
+
+    collision_checkbox = ft.Checkbox(
+        label="Kollisionen behandeln",
+        value=state["handle_collisions"],
+        on_change=on_collision_checkbox_change,
+    )
+
+    # --- Regeln -----------------------------------------------------------
     rules_column = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, expand=True)
 
     def rebuild_rules_ui():
-        """Zeichnet die Regel-Liste neu."""
         rules_column.controls.clear()
         for idx, r in enumerate(rules_ui):
             row = ft.Row(
                 spacing=6,
                 controls=[
                     ft.TextField(
-                        label="Suchen",
+                        label="Wildcard Suche",
                         value=r["search"].value,
                         expand=2,
                         on_change=lambda e, i=idx: (
-                            rules_ui[i]["search"].__setattr__("value", e.control.value),
+                            setattr(rules_ui[i]["search"], "value", e.control.value),
                             refresh_preview(),
+                            page.update(),
                         ),
                     ),
                     ft.TextField(
@@ -325,8 +486,9 @@ def main(page: ft.Page) -> None:
                         value=r["replace"].value,
                         expand=2,
                         on_change=lambda e, i=idx: (
-                            rules_ui[i]["replace"].__setattr__("value", e.control.value),
+                            setattr(rules_ui[i]["replace"], "value", e.control.value),
                             refresh_preview(),
+                            page.update(),
                         ),
                     ),
                     ft.Checkbox(
@@ -335,28 +497,25 @@ def main(page: ft.Page) -> None:
                         on_change=lambda e, i=idx: (
                             rules_ui[i].__setitem__("required", e.control.value),
                             refresh_preview(),
+                            page.update(),
                         ),
                     ),
                     ft.IconButton(
                         icon=ft.Icons.ARROW_UPWARD,
-                        tooltip="Nach oben",
                         on_click=lambda e, i=idx: move_rule(i, -1),
                     ),
                     ft.IconButton(
                         icon=ft.Icons.ARROW_DOWNWARD,
-                        tooltip="Nach unten",
                         on_click=lambda e, i=idx: move_rule(i, +1),
                     ),
                     ft.IconButton(
                         icon=ft.Icons.DELETE,
-                        tooltip="Regel entfernen",
                         icon_color=ft.Colors.RED_400,
                         on_click=lambda e, i=idx: remove_rule(i),
                     ),
                 ],
             )
             rules_column.controls.append(row)
-        page.update()
 
     def add_rule(e=None):
         rules_ui.append(
@@ -368,12 +527,14 @@ def main(page: ft.Page) -> None:
         )
         rebuild_rules_ui()
         refresh_preview()
+        page.update()
 
     def remove_rule(index: int):
         if 0 <= index < len(rules_ui):
             rules_ui.pop(index)
             rebuild_rules_ui()
             refresh_preview()
+            page.update()
 
     def move_rule(index: int, delta: int):
         new_index = index + delta
@@ -381,24 +542,27 @@ def main(page: ft.Page) -> None:
             rules_ui[index], rules_ui[new_index] = rules_ui[new_index], rules_ui[index]
             rebuild_rules_ui()
             refresh_preview()
+            page.update()
 
-    add_rule_button = ft.ElevatedButton(
+    add_rule_button = ft.Button(
         "Regel hinzufügen", icon=ft.Icons.ADD, on_click=add_rule
     )
 
-    # ------------------------------------------------------------------
-    # Vorschau
-    # ------------------------------------------------------------------
+    # --- Vorschau ---------------------------------------------------------
     preview_list = ft.ListView(expand=True, spacing=2, padding=8)
 
     status_colors = {
         "OK": ft.Colors.GREEN_400,
+        "OK (angepasst)": ft.Colors.CYAN_300,
         "Kollision": ft.Colors.RED_400,
         "Übersprungen": ft.Colors.GREY_400,
     }
 
     def refresh_preview(*_):
-        """Berechnet die Vorschau neu und aktualisiert die UI."""
+        """
+        Baut den Inhalt der Vorschau neu auf. Macht KEIN eigenes update() –
+        der Aufrufer ist dafür verantwortlich, page.update() aufzurufen.
+        """
         preview_list.controls.clear()
         rules_data = [
             {
@@ -413,7 +577,6 @@ def main(page: ft.Page) -> None:
             preview_list.controls.append(
                 ft.Text("Kein Verzeichnis gewählt.", color=ft.Colors.GREY_500)
             )
-            page.update()
             return
 
         try:
@@ -423,63 +586,92 @@ def main(page: ft.Page) -> None:
                 state["include_subfolders"],
                 rules_data,
                 state["case_sensitive"],
+                state["handle_collisions"],
+                state["suffix"],
+                state["leading_zeros"],
             )
         except Exception as ex:
-            preview_list.controls.append(ft.Text(f"Fehler: {ex}", color=ft.Colors.RED_400))
-            page.update()
+            preview_list.controls.append(
+                ft.Text(f"Fehler: {ex}", color=ft.Colors.RED_400)
+            )
             return
 
         if not items:
             preview_list.controls.append(
                 ft.Text("Keine passenden Einträge gefunden.", color=ft.Colors.GREY_500)
             )
-            page.update()
             return
 
-        # Header
-        preview_list.controls.append(
-            ft.Row(
-                controls=[
-                    ft.Text("Alter Name", weight=ft.FontWeight.BOLD, expand=3),
-                    ft.Text("Neuer Name", weight=ft.FontWeight.BOLD, expand=3),
-                    ft.Text("Status", weight=ft.FontWeight.BOLD, width=110),
-                ],
-                spacing=8,
-            )
-        )
-
+        # Gruppierung nach Elternverzeichnis (für Zwischenüberschriften)
+        root = Path(directory)
+        grouped: dict[str, list[dict]] = {}
         for it in items:
-            color = status_colors.get(it["status"], ft.Colors.WHITE)
+            grouped.setdefault(it["parent"], []).append(it)
+
+        # Elternverzeichnisse sortiert nach relativem Pfad
+        def rel_label(parent: str) -> str:
+            try:
+                rel = Path(parent).relative_to(root)
+                s = str(rel)
+                return str(root) if s == "." else f"{root} / {s}"
+            except ValueError:
+                return parent
+
+        sorted_parents = sorted(grouped.keys(), key=lambda p: rel_label(p))
+
+        for parent in sorted_parents:
+            # Zwischenüberschrift
+            preview_list.controls.append(
+                ft.Container(
+                    padding=ft.Padding.only(top=8, bottom=4),
+                    content=ft.Text(
+                        rel_label(parent),
+                        weight=ft.FontWeight.BOLD,
+                        size=13,
+                        color=ft.Colors.BLUE_200,
+                    ),
+                )
+            )
+            # Kopfzeile pro Gruppe
             preview_list.controls.append(
                 ft.Row(
                     controls=[
-                        ft.Text(it["old"], expand=3, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Text(
-                            it["new"],
-                            expand=3,
-                            no_wrap=True,
-                            overflow=ft.TextOverflow.ELLIPSIS,
-                            color=color if it["status"] != "OK" else None,
-                        ),
-                        ft.Text(it["status"], width=110, color=color),
+                        ft.Text("Alter Name", weight=ft.FontWeight.BOLD, expand=3),
+                        ft.Text("Neuer Name", weight=ft.FontWeight.BOLD, expand=3),
+                        ft.Text("Status", weight=ft.FontWeight.BOLD, width=130),
                     ],
                     spacing=8,
                 )
             )
-        page.update()
+            for it in grouped[parent]:
+                color = status_colors.get(it["status"], ft.Colors.WHITE)
+                preview_list.controls.append(
+                    ft.Row(
+                        controls=[
+                            ft.Text(
+                                it["old"],
+                                expand=3,
+                                no_wrap=True,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                            ft.Text(
+                                it["new"],
+                                expand=3,
+                                no_wrap=True,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                                color=color if it["status"] != "OK" else None,
+                            ),
+                            ft.Text(it["status"], width=130, color=color),
+                        ],
+                        spacing=8,
+                    )
+                )
+            preview_list.controls.append(ft.Divider(height=1))
 
-    # ------------------------------------------------------------------
-    # Historie
-    # ------------------------------------------------------------------
-    history_dropdown = ft.Dropdown(
-        label="Historie",
-        width=420,
-        options=[],
-        on_change=lambda e: load_history_entry(int(e.control.value)),
-    )
+    # --- Historie (Buttons-Liste statt Dropdown) -------------------------
+    history_list = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO)
 
     def history_key(rules_data: list[dict]) -> str:
-        """Eindeutiger Schlüssel über search/replace/required."""
         return json.dumps(
             [
                 {
@@ -493,24 +685,37 @@ def main(page: ft.Page) -> None:
             ensure_ascii=False,
         )
 
-    def refresh_history_dropdown():
-        history_dropdown.options.clear()
-        # Neueste zuerst
-        for i, entry in enumerate(reversed(history)):
-            n = len(entry.get("rules", []))
-            label = f"{entry.get('timestamp', '')} ({n}x)"
-            history_dropdown.options.append(ft.dropdown.Option(key=str(i), text=label))
-        page.update()
-
-    def load_history_entry(idx: int):
-        # idx bezieht sich auf umgekehrte Liste
-        if idx < 0 or idx >= len(history):
+    def refresh_history_ui():
+        """Baut die Historie-Buttons neu auf. Kein eigenes update()."""
+        history_list.controls.clear()
+        if not history:
+            history_list.controls.append(
+                ft.Text(
+                    "Noch keine Historie vorhanden.",
+                    size=12,
+                    color=ft.Colors.GREY_500,
+                )
+            )
             return
-        real_index = len(history) - 1 - idx
-        entry = history[real_index]
-        current_has_rules = any(r["search"].value for r in rules_ui)
+        # Einträge mit Label vorbereiten und absteigend nach Label sortieren
+        labeled_entries = []
+        for entry in history:
+            n = len(entry.get("rules", []))
+            ts = entry.get("timestamp", "")
+            label = f"{ts}  ({n} Regel(n))"
+            labeled_entries.append((label, entry))
 
-        def do_load(e=None):
+        labeled_entries.sort(key=lambda pair: pair[0], reverse=True)
+
+        for label, entry in labeled_entries:
+            history_list.controls.append(
+                ft.TextButton(
+                    content=ft.Text(label, size=12),
+                    on_click=lambda e, ent=entry: load_history_entry(ent),
+                )
+            )
+
+        def load_history_entry(entry: dict):
             rules_ui.clear()
             for r in entry.get("rules", []):
                 rules_ui.append(
@@ -522,27 +727,21 @@ def main(page: ft.Page) -> None:
                 )
             rebuild_rules_ui()
             refresh_preview()
-            page.close(dlg)
+            page.update()
 
-        dlg = None
-        if current_has_rules:
-            dlg = ft.AlertDialog(
-                title=ft.Text("Historie laden"),
-                content=ft.Text(
-                    "Die aktuelle Regel-Liste wird überschrieben. Fortfahren?"
-                ),
-                actions=[
-                    ft.TextButton("Abbrechen", on_click=lambda e: page.close(dlg)),
-                    ft.TextButton("Laden", on_click=do_load),
-                ],
-            )
-            page.open(dlg)
-        else:
-            do_load()
+    # --- Nachrichten-Dialog ----------------------------------------------
+    async def show_message(msg: str, error: bool = False):
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Fehler" if error else "Info"),
+            content=ft.Text(msg, selectable=True),
+            actions=[
+                ft.TextButton("OK", on_click=lambda e: page.pop_dialog())
+            ],
+        )
+        page.show_dialog(dlg)
 
-    # ------------------------------------------------------------------
-    # Anwenden
-    # ------------------------------------------------------------------
+    # --- Anwenden ---------------------------------------------------------
     def _collect_rules() -> list[dict]:
         return [
             {
@@ -553,104 +752,24 @@ def main(page: ft.Page) -> None:
             for r in rules_ui
         ]
 
-    def apply_renames(e):
-        rules_data = _collect_rules()
-        if not state["directory"]:
-            show_message("Bitte zuerst ein Verzeichnis wählen.")
-            return
-        if not rules_data or not any(r["search"] for r in rules_data):
-            show_message("Bitte mindestens eine Regel mit Suchbegriff definieren.")
-            return
-
-        preview = build_preview(
-            state["directory"],
-            state["mode"],
-            state["include_subfolders"],
-            rules_data,
-            state["case_sensitive"],
-        )
-        collisions = [p for p in preview if p["status"] == "Kollision"]
-        if collisions:
-            show_message(
-                f"{len(collisions)} Kollision(en) gefunden. "
-                "Bitte Regeln anpassen, damit alle Zielnamen eindeutig sind.",
-                error=True,
-            )
-            return
-
-        to_rename = [p for p in preview if p["status"] == "OK"]
-        if not to_rename:
-            show_message("Keine Umbenennungen nötig.")
-            return
-
-        # Umbenennen
-        errors: list[str] = []
-        try:
-            _apply_with_collision_resolution(
-                preview, state["suffix"], state["leading_zeros"], errors
-            )
-        except Exception as ex:
-            errors.append(str(ex))
-
-        # Historie aktualisieren
-        _save_history_entry(rules_data)
-
-        if errors:
-            show_message("Umbenennung mit Fehlern:\n" + "\n".join(errors[:10]), error=True)
-        else:
-            show_message(f"{len(to_rename)} Eintrag/Einträge umbenannt.")
-
-        refresh_preview()
-
-    def _apply_with_collision_resolution(
-        preview: list[dict],
-        suffix: str,
-        leading_zeros: int,
-        errors: list[str],
-    ):
-        """
-        Führt die Umbenennung aus. Da Kollisionen vorher ausgeschlossen wurden,
-        werden Suffix und führende Nullen nur genutzt, falls beim Anwenden
-        doch eine Kollision auftritt (z.B. externer Eingriff) - dann wird
-        fortlaufend nummeriert.
-        """
-        # Zuerst alle gewünschten Zielnamen sammeln, um Kollisionen zu erkennen
-        target_map: dict[str, int] = {}
-        for item in preview:
-            if item["status"] != "OK":
-                continue
-            parent = str(Path(item["path"]).parent)
-            target_map[(parent, item["new"].lower())] = target_map.get(
-                (parent, item["new"].lower()), 0
-            ) + 1
-
-        counter_per_parent: dict[tuple[str, str], int] = {}
-        for item in preview:
-            if item["status"] != "OK":
+    def _apply_preview_items(items: list[dict], errors: list[str]):
+        """Führt die im Preview bereits aufgelösten Umbenennungen aus."""
+        for item in items:
+            if item["status"] not in ("OK", "OK (angepasst)"):
                 continue
             src = Path(item["path"])
-            parent = str(src.parent)
             desired = item["new"]
             try:
                 dst = src.with_name(desired)
-                # Kollision mit existierender Datei?
-                if dst.exists() and str(dst) != str(src):
-                    # Nummer anhängen
-                    stem = Path(desired).stem
-                    ext = Path(desired).suffix if state["mode"] == "file" else ""
-                    key = (parent, desired.lower())
-                    n = counter_per_parent.get(key, 0) + 1
-                    counter_per_parent[key] = n
-                    num = str(n).zfill(max(0, leading_zeros))
-                    candidate = f"{stem}{suffix}{num}{ext}"
-                    dst = src.with_name(candidate)
-                    # Falls weiterhin existierend: hochzählen
-                    while dst.exists() and str(dst) != str(src):
-                        n += 1
-                        counter_per_parent[key] = n
-                        num = str(n).zfill(max(0, leading_zeros))
-                        candidate = f"{stem}{suffix}{num}{ext}"
-                        dst = src.with_name(candidate)
+                if str(dst) == str(src):
+                    continue
+                if dst.exists():
+                    # Sollte durch die Auflösung nicht mehr vorkommen,
+                    # aber als Sicherheitsnetz: überspringen.
+                    errors.append(
+                        f"{src.name}: Ziel existiert bereits ({desired})"
+                    )
+                    continue
                 os.rename(src, dst)
             except Exception as ex:
                 errors.append(f"{src.name}: {ex}")
@@ -659,7 +778,6 @@ def main(page: ft.Page) -> None:
         if not rules_data or not any(r["search"] for r in rules_data):
             return
         key = history_key(rules_data)
-        # existierenden Eintrag finden
         existing_idx = None
         for i, entry in enumerate(history):
             if history_key(entry.get("rules", [])) == key:
@@ -671,57 +789,106 @@ def main(page: ft.Page) -> None:
             "rules": rules_data,
         }
         if existing_idx is not None:
-            # Eintrag aktualisieren (nach vorne schieben)
             history.pop(existing_idx)
         history.append(entry)
-        # Auf 10 begrenzen
         while len(history) > 10:
             history.pop(0)
         save_history(history)
-        refresh_history_dropdown()
+        refresh_history_ui()
 
-    # ------------------------------------------------------------------
-    # Nachrichten-Dialog
-    # ------------------------------------------------------------------
-    def show_message(msg: str, error: bool = False):
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Fehler" if error else "Info"),
-            content=ft.Text(msg, selectable=True),
-            actions=[ft.TextButton("OK", on_click=lambda e: page.close(dlg))],
+    async def apply_renames(e):
+        rules_data = _collect_rules()
+        if not state["directory"]:
+            await show_message("Bitte zuerst ein Verzeichnis wählen.")
+            return
+        if not rules_data or not any(r["search"] for r in rules_data):
+            await show_message(
+                "Bitte mindestens eine Regel mit Suchbegriff definieren."
+            )
+            return
+
+        preview = build_preview(
+            state["directory"],
+            state["mode"],
+            state["include_subfolders"],
+            rules_data,
+            state["case_sensitive"],
+            state["handle_collisions"],
+            state["suffix"],
+            state["leading_zeros"],
         )
-        page.open(dlg)
+        collisions = [p for p in preview if p["status"] == "Kollision"]
 
-    # ------------------------------------------------------------------
-    # Buttons unterer Bereich
-    # ------------------------------------------------------------------
-    apply_button = ft.ElevatedButton(
+        if collisions and not state["handle_collisions"]:
+            await show_message(
+                f"{len(collisions)} Kollision(en) gefunden. "
+                "Aktiviere 'Kollisionen behandeln' oder passe die Regeln an, "
+                "damit alle Zielnamen eindeutig sind.",
+                error=True,
+            )
+            return
+
+        to_rename = [
+            p for p in preview if p["status"] in ("OK", "OK (angepasst)")
+        ]
+        if not to_rename:
+            await show_message("Keine Umbenennungen nötig.")
+            return
+
+        errors: list[str] = []
+        try:
+            _apply_preview_items(preview, errors)
+        except Exception as ex:
+            errors.append(str(ex))
+
+        _save_history_entry(rules_data)
+
+        refresh_preview()
+        page.update()
+
+        if errors:
+            await show_message(
+                "Umbenennung mit Fehlern:\n" + "\n".join(errors[:10]), error=True
+            )
+        else:
+            await show_message(f"{len(to_rename)} Eintrag/Einträge umbenannt.")
+
+    apply_button = ft.Button(
         "Anwenden",
         icon=ft.Icons.PLAY_ARROW,
         on_click=apply_renames,
         style=ft.ButtonStyle(color=ft.Colors.WHITE, bgcolor=ft.Colors.GREEN_700),
     )
 
-    # ------------------------------------------------------------------
-    # Layout
-    # ------------------------------------------------------------------
+    # --- Layout -----------------------------------------------------------
+    history_panel = ft.Container(
+        width=360,
+        content=ft.Column(
+            spacing=2,
+            controls=[
+                ft.Text("Historie", weight=ft.FontWeight.BOLD, size=13),
+                ft.Container(
+                    content=history_list,
+                    height=90,
+                ),
+            ],
+        ),
+    )
+
     top_bar = ft.Column(
         spacing=8,
         controls=[
+            ft.Row(spacing=8, controls=[directory_field, directory_button]),
             ft.Row(
-                spacing=8,
-                controls=[directory_field, directory_button],
-            ),
-            ft.Row(
-                spacing=24,
-                wrap=True,
+                spacing=16,
+                wrap=False,
+                vertical_alignment=ft.CrossAxisAlignment.START,
                 controls=[
-                    ft.Container(
-                        content=mode_segmented,
-                        padding=ft.padding.symmetric(vertical=4),
-                    ),
+                    mode_segmented,
                     subfolders_checkbox,
                     case_checkbox,
+                    ft.Container(expand=True),   # Spacer: drückt Historie nach rechts
+                    history_panel,
                 ],
             ),
         ],
@@ -757,23 +924,29 @@ def main(page: ft.Page) -> None:
         controls=[left_panel, ft.VerticalDivider(width=1), right_panel],
     )
 
+    history_panel = ft.Container(
+        width=420,
+        content=ft.Column(
+            spacing=4,
+            controls=[
+                ft.Text("Historie", weight=ft.FontWeight.BOLD, size=13),
+                ft.Container(
+                    content=history_list,
+                    height=130,
+                ),
+            ],
+        ),
+    )
+
     bottom_bar = ft.Column(
         spacing=8,
         controls=[
             ft.Row(
                 spacing=16,
                 wrap=True,
-                controls=[
-                    ft.Text("Kollisionsauflösung – Suffix:", size=12),
-                    suffix_field,
-                    leading_zeros_field,
-                ],
+                controls=[collision_checkbox, collision_options_container],
             ),
-            ft.Row(
-                spacing=16,
-                wrap=True,
-                controls=[apply_button, history_dropdown],
-            ),
+            ft.Row(spacing=16, wrap=True, controls=[apply_button]),
         ],
     )
 
@@ -781,29 +954,22 @@ def main(page: ft.Page) -> None:
         ft.Column(
             expand=True,
             spacing=12,
-            controls=[
-                top_bar,
-                ft.Divider(),
-                middle,
-                ft.Divider(),
-                bottom_bar,
-            ],
+            controls=[top_bar, ft.Divider(), middle, ft.Divider(), bottom_bar],
         )
     )
 
-    # Initiale Regel: eine leere Regel anlegen
     add_rule()
-    refresh_history_dropdown()
+    refresh_history_ui()
     refresh_preview()
+    page.update()
 
 
 def _parse_int(value: str) -> int:
     try:
-        v = int(value)
-        return max(0, v)
+        return max(0, int(value))
     except (ValueError, TypeError):
         return 0
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)
