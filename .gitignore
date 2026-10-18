@@ -1,0 +1,41 @@
+# Flet Build Output
+# Standardmäßig wird der Build in build/<platform> ausgegeben
+build/
+# Falls ein anderer Output-Ordner genutzt wird, hier ergänzen:
+# dist/
+# output/
+
+# Flet Entwicklungs-Cache (wird von flet run automatisch erstellt)
+.flet/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Distribution / Packaging
+*.egg-info/
+.eggs/
+dist/
+wheels/
+*.egg
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
