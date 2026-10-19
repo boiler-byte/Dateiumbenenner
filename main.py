@@ -153,6 +153,17 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     return name.strip().rstrip(".") or "_"
 
+def natural_sort_key(s: str):
+    """
+    Sortierschlüssel für natürliche Sortierung.
+    '8.jpg' kommt vor '10.jpg'.
+    Zahlenblöcke werden als int verglichen, Textblöcke als lowercase-String.
+    """
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", s)
+    ]
+
 
 def scan_targets(directory: str, mode: str, include_subfolders: bool) -> list[Path]:
     if not directory or not Path(directory).is_dir():
@@ -162,14 +173,17 @@ def scan_targets(directory: str, mode: str, include_subfolders: bool) -> list[Pa
     if include_subfolders:
         for current, dirs, files in os.walk(root):
             cur = Path(current)
+            # Unterordner selbst natürlich sortieren, damit os.walk
+            # sie in dieser Reihenfolge abarbeitet
+            dirs.sort(key=natural_sort_key)
             if mode == "file":
-                for f in files:
+                for f in sorted(files, key=natural_sort_key):
                     results.append(cur / f)
             else:
-                for d in dirs:
+                for d in sorted(dirs, key=natural_sort_key):
                     results.append(cur / d)
     else:
-        for entry in sorted(root.iterdir()):
+        for entry in sorted(root.iterdir(), key=lambda p: natural_sort_key(p.name)):
             if mode == "file" and entry.is_file():
                 results.append(entry)
             elif mode == "dir" and entry.is_dir():
@@ -182,8 +196,12 @@ def _build_numbered_name(
 ) -> str:
     """Baut aus 'desired' einen Namen mit Suffix + Nummer vor der Endung."""
     if is_file:
-        stem = Path(desired).stem
-        ext = Path(desired).suffix
+        if desired.startswith(".") and Path(desired).suffix == "":
+            stem = ""
+            ext = Path(desired).stem
+        else:
+            stem = Path(desired).stem
+            ext = Path(desired).suffix
     else:
         stem = desired
         ext = ""
@@ -308,7 +326,7 @@ def build_preview(
             while True:
                 n += 1
                 candidate = _build_numbered_name(
-                    desired, suffix or "_", n, leading_zeros, is_file_mode
+                    desired, suffix or "", n, leading_zeros, is_file_mode
                 )
                 cand_key = candidate.lower()
                 if cand_key not in blocking and cand_key not in reserved:
@@ -340,7 +358,7 @@ def main(page: ft.Page) -> None:
         "include_subfolders": False,
         "case_sensitive": bool(config.get("case_sensitive", True)),
         "handle_collisions": bool(config.get("handle_collisions", False)),
-        "suffix": "_",
+        "suffix": "",
         "leading_zeros": 0,
     }
 
@@ -414,7 +432,7 @@ def main(page: ft.Page) -> None:
 
     # --- Kollisionsoptionen ----------------------------------------------
     def on_suffix_change(e):
-        state["suffix"] = e.control.value or "_"
+        state["suffix"] = e.control.value or ""
         refresh_preview()
         page.update()
 
@@ -752,27 +770,70 @@ def main(page: ft.Page) -> None:
             for r in rules_ui
         ]
 
+    RENAME_PREFIX = "--dateiumbenenner--"
+
     def _apply_preview_items(items: list[dict], errors: list[str]):
-        """Führt die im Preview bereits aufgelösten Umbenennungen aus."""
-        for item in items:
-            if item["status"] not in ("OK", "OK (angepasst)"):
-                continue
+        """
+        Führt die im Preview aufgelösten Umbenennungen in zwei Phasen aus:
+
+        Phase 1: Alle betroffenen Dateien werden in '<RENAME_PREFIX><zielname>'
+                umbenannt. Dadurch kollidieren sie nicht mehr mit den
+                Originalnamen anderer Dateien (die ja noch existieren).
+        Phase 2: Das Präfix wird wieder entfernt → endgültiger Zielname.
+
+        Sollte in Phase 1 ein Name mit Präfix bereits existieren (z. B. weil
+        schon einmal abgebrochen wurde), wird ein Zähler angehängt.
+        """
+        to_rename = [
+            it for it in items
+            if it["status"] in ("OK", "OK (angepasst)")
+        ]
+        if not to_rename:
+            return
+
+        # ---------- Phase 1: temporäre Namen ----------
+        phase1: list[tuple[Path, Path]] = []  # (temporärer Pfad, endgültiger Pfad)
+        used_temp: set[str] = set()
+
+        for item in to_rename:
             src = Path(item["path"])
             desired = item["new"]
+            final_dst = src.with_name(desired)
+
+            if str(final_dst) == str(src):
+                # Name unverändert – nichts zu tun
+                continue
+
+            temp_name = f"{RENAME_PREFIX}{desired}"
+            temp_dst = src.with_name(temp_name)
+
+            # Falls der temporäre Name schon belegt ist, hochzählen.
+            counter = 1
+            while temp_dst.exists() or str(temp_dst).lower() in used_temp:
+                temp_name = f"{RENAME_PREFIX}{counter}_{desired}"
+                temp_dst = src.with_name(temp_name)
+                counter += 1
+            used_temp.add(str(temp_dst).lower())
+
             try:
-                dst = src.with_name(desired)
-                if str(dst) == str(src):
-                    continue
-                if dst.exists():
-                    # Sollte durch die Auflösung nicht mehr vorkommen,
-                    # aber als Sicherheitsnetz: überspringen.
+                os.rename(src, temp_dst)
+                phase1.append((temp_dst, final_dst))
+            except Exception as ex:
+                errors.append(f"{src.name} → temporär: {ex}")
+
+        # ---------- Phase 2: Präfix entfernen ----------
+        for temp_dst, final_dst in phase1:
+            try:
+                if final_dst.exists():
+                    # Sollte im Normalfall nicht passieren, da alle Quellnamen
+                    # in Phase 1 "freigeworden" sind. Als Sicherheitsnetz:
                     errors.append(
-                        f"{src.name}: Ziel existiert bereits ({desired})"
+                        f"{temp_dst.name}: Ziel existiert bereits ({final_dst.name})"
                     )
                     continue
-                os.rename(src, dst)
+                os.rename(temp_dst, final_dst)
             except Exception as ex:
-                errors.append(f"{src.name}: {ex}")
+                errors.append(f"{temp_dst.name} → final: {ex}")
 
     def _save_history_entry(rules_data: list[dict]):
         if not rules_data or not any(r["search"] for r in rules_data):

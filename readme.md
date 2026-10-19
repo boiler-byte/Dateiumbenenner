@@ -1,6 +1,7 @@
 # Benötigt python und flet 1.0.
 
 pip install pyinstaller
+
 pip install flet[all]
 
 # Erzeugt die exe Datei (knapp 80MB)
